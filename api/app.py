@@ -5,7 +5,7 @@ Provides comprehensive API with:
 - OAuth2/JWT authentication (from complete_1) - NOW DB-BACKED
 - Processing endpoints (parallel/sequential options)
 - Learning system endpoints (submit, approve, review)
-- Audit logging for HIPAA compliance
+- Audit logging for HIPAA compliance - NOW DB-BACKED
 - Performance metrics
 - WebSocket support for real-time updates
 
@@ -15,7 +15,7 @@ Security: Role-based access control (RBAC)
 - approve: Approve learning patterns (admin only)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -30,8 +30,8 @@ import os
 from dotenv import load_dotenv
 from contextlib import contextmanager
 
-# --- DB IMPORTS (Fix #2) ---
-from sqlalchemy import create_engine
+# --- DB IMPORTS (Fix #2 + Persistence Fix) ---
+from sqlalchemy import create_engine, desc
 from sqlalchemy.orm import sessionmaker, Session
 # --- END DB IMPORTS ---
 
@@ -39,8 +39,8 @@ from sqlalchemy.orm import sessionmaker, Session
 import sys
 sys.path.insert(0, '..')
 from src.engine import HybridNeurosurgicalDCSEngine
-# --- DB MODEL IMPORT (Fix #2) ---
-from src.database.models import User as UserModel, Base
+# --- DB MODEL IMPORT (Fix #2 + Persistence Fix) ---
+from src.database.models import User as UserModel, Base, AuditLog, ProcessingSession as SessionModel
 # --- END DB MODEL IMPORT ---
 
 
@@ -104,9 +104,8 @@ db_engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
 
-# Create tables if they don't exist (for dev/SQLite)
-if "sqlite" in DATABASE_URL:
-    Base.metadata.create_all(bind=db_engine)
+# Create tables if they don't exist (for all databases)
+Base.metadata.create_all(bind=db_engine)
 
 @contextmanager
 def get_db_session():
@@ -126,13 +125,9 @@ def get_db():
         db.close()
 
 # ========================= REMOVED IN-MEMORY STORES =========================
-# --- FIX #2: REMOVED USER_DATABASE DICTIONARY ---
-
-# Audit log storage (still in-memory for this example, move to DB for full prod)
-AUDIT_LOG = []
-
-# Processing sessions (in-memory for this example, move to DB for full prod)
-PROCESSING_SESSIONS = {}
+# --- FIX: REMOVED USER_DATABASE DICTIONARY ---
+# --- FIX: REMOVED AUDIT_LOG = [] ---
+# --- FIX: REMOVED PROCESSING_SESSIONS = {} ---
 
 # ========================= PYDANTIC MODELS =========================
 
@@ -145,6 +140,7 @@ class TokenData(BaseModel):
     username: Optional[str] = None
 
 class User(BaseModel):
+    id: int  # ADDED: Required for foreign key relationships
     username: str
     full_name: Optional[str] = None
     email: Optional[str] = None
@@ -244,6 +240,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 
     # Convert SQLAlchemy UserModel to Pydantic User model
     return User(
+        id=user.id,  # ADDED: Include ID for foreign keys
         username=user.username,
         full_name=user.full_name,
         email=user.email,
@@ -261,21 +258,29 @@ def check_permission(user: User, permission: str):
         )
     return True
 
-# ========================= AUDIT LOGGING =========================
+# ========================= AUDIT LOGGING (PERSISTENCE FIX) =========================
 
-def log_audit_event(user: User, action: str, details: Dict):
-    """Log audit event for compliance"""
-    # This should also be moved to the database for production
-    event = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "username": user.username,
-        "department": user.department,
-        "role": user.role,
-        "action": action,
-        "details": details
-    }
-    AUDIT_LOG.append(event)
-    logger.info(f"Audit: {user.username} - {action}")
+def log_audit_event(user: User, action: str, details: Dict, db: Session, request: Optional[Request] = None):
+    """Log audit event for compliance to the database"""
+    try:
+        ip_address = request.client.host if request else None
+        user_agent = request.headers.get("user-agent") if request else None
+
+        log_entry = AuditLog(
+            user_id=user.id,  # Use the ID from the Pydantic User model
+            action=action,
+            resource_type=details.get("resource_type"),
+            resource_id=details.get("resource_id"),
+            details=details,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        db.add(log_entry)
+        db.commit()
+        logger.info(f"Audit: {user.username} - {action}")
+    except Exception as e:
+        logger.error(f"Failed to write audit log to database: {e}")
+        db.rollback()
 
 # ========================= STARTUP/SHUTDOWN =========================
 
@@ -283,6 +288,26 @@ def log_audit_event(user: User, action: str, details: Dict):
 async def startup_event():
     """Initialize engine on startup"""
     global engine
+
+    # Create a default admin user if one doesn't exist (for dev)
+    with get_db_session() as db:
+        admin = get_user("admin", db)
+        if not admin:
+            logger.info("Creating default 'admin' user with password 'admin123'")
+            admin_user = UserModel(
+                username="admin",
+                full_name="System Administrator",
+                email="admin@hospital.org",
+                hashed_password=pwd_context.hash("admin123"),
+                department="it",
+                role="admin",
+                permissions=["read", "write", "approve", "manage"],
+                is_active=True
+            )
+            db.add(admin_user)
+            db.commit()
+
+    # Initialize the main engine
     engine = HybridNeurosurgicalDCSEngine(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
         enable_learning=True
@@ -348,13 +373,15 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
     """Get current authenticated user information"""
     return current_user
 
-# ========================= PROCESSING ENDPOINTS =========================
+# ========================= PROCESSING ENDPOINTS (PERSISTENCE FIX) =========================
 
 @app.post("/api/process")
 async def process_documents(
-    request: ProcessRequest,
+    request_data: ProcessRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user)
+    request: Request,  # ADDED for IP/User-Agent
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)  # ADDED for DB session
 ):
     """
     Main processing endpoint - generate discharge summary
@@ -373,44 +400,55 @@ async def process_documents(
     check_permission(current_user, "write")
 
     try:
-        # Log audit event
+        # Log audit event to database
         log_audit_event(current_user, "PROCESS_DOCUMENTS", {
-            "document_count": len(request.documents),
-            "use_parallel": request.use_parallel,
-            "use_cache": request.use_cache,
-            "apply_learning": request.apply_learning
-        })
+            "resource_type": "processing_session",
+            "document_count": len(request_data.documents),
+            "use_parallel": request_data.use_parallel,
+            "use_cache": request_data.use_cache,
+            "apply_learning": request_data.apply_learning
+        }, db, request)
 
         # Process documents
         result = await engine.process_hospital_course(
-            documents=request.documents,
-            use_parallel=request.use_parallel,
-            use_cache=request.use_cache,
-            apply_learning=request.apply_learning
+            documents=request_data.documents,
+            use_parallel=request_data.use_parallel,
+            use_cache=request_data.use_cache,
+            apply_learning=request_data.apply_learning
         )
 
-        # Generate session ID for uncertainty resolution workflow
-        session_id = str(uuid.uuid4())
-        PROCESSING_SESSIONS[session_id] = {
-            "user": current_user.username,
-            "timestamp": datetime.utcnow().isoformat(),
-            "result": result,
-            "documents": request.documents
-        }
+        # Create ProcessingSession in database
+        session_id = uuid.uuid4()
+        db_session = SessionModel(
+            id=session_id,
+            user_id=current_user.id,
+            status='completed' if not result.get('requires_review') else 'pending_review',
+            document_count=len(request_data.documents),
+            confidence_score=result.get('confidence_score'),
+            requires_review=result.get('requires_review', False),
+            custom_metadata={
+                "use_parallel": request_data.use_parallel,
+                "use_cache": request_data.use_cache,
+                "apply_learning": request_data.apply_learning
+            }
+        )
+        db.add(db_session)
+        db.commit()
 
-        result['session_id'] = session_id
+        result['session_id'] = str(session_id)
 
         return result
 
     except Exception as e:
         logger.error(f"Processing error: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 # ========================= BULK IMPORT ENDPOINTS =========================
 
 @app.post("/api/bulk-import/parse", response_model=BulkImportResponse)
 async def parse_bulk_documents(
-    request: BulkImportRequest,
+    bulk_request: BulkImportRequest,
     current_user: User = Depends(get_current_user)
 ):
     """
@@ -432,24 +470,24 @@ async def parse_bulk_documents(
 
         # Determine separator
         separator = None
-        if request.separator_type == 'auto':
+        if bulk_request.separator_type == 'auto':
             # Auto-detect triple dash separator
-            if '---' in request.bulk_text:
+            if '---' in bulk_request.bulk_text:
                 separator = '---'
-            elif '\n\n\n' in request.bulk_text:
+            elif '\n\n\n' in bulk_request.bulk_text:
                 separator = '\n\n\n'
             else:
                 warnings.append("No clear separator found. Using double newline as fallback.")
                 separator = '\n\n'
-        elif request.separator_type == 'triple_dash':
+        elif bulk_request.separator_type == 'triple_dash':
             separator = '---'
-        elif request.separator_type == 'custom' and request.custom_separator:
-            separator = request.custom_separator
+        elif bulk_request.separator_type == 'custom' and bulk_request.custom_separator:
+            separator = bulk_request.custom_separator
         else:
             raise HTTPException(status_code=400, detail="Invalid separator configuration")
 
         # Split text into chunks
-        chunks = [chunk.strip() for chunk in request.bulk_text.split(separator) if chunk.strip()]
+        chunks = [chunk.strip() for chunk in bulk_request.bulk_text.split(separator) if chunk.strip()]
 
         if len(chunks) == 0:
             return BulkImportResponse(
@@ -512,12 +550,14 @@ async def parse_bulk_documents(
         logger.error(f"Bulk import parse error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========================= LEARNING SYSTEM ENDPOINTS (Fix #1) =========================
+# ========================= LEARNING SYSTEM ENDPOINTS (Fix #1 + Persistence Fix) =========================
 
 @app.post("/api/learning/feedback")
 async def submit_learning_feedback(
     feedback_request: LearningFeedbackRequest,
-    current_user: User = Depends(get_current_user)
+    request: Request,  # ADDED for IP/User-Agent
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)  # ADDED for DB session
 ):
     """
     Submit learning feedback from uncertainty resolution
@@ -538,12 +578,14 @@ async def submit_learning_feedback(
             created_by=current_user.username
         )
 
-        # Log audit event
+        # Log audit event to database
         log_audit_event(current_user, "SUBMIT_LEARNING_FEEDBACK", {
+            "resource_type": "learning_pattern",
+            "resource_id": pattern_id,
             "pattern_id": pattern_id[:8],
             "uncertainty_id": feedback_request.uncertainty_id,
             "fact_type": feedback_request.context.get('fact_type')
-        })
+        }, db, request)
 
         # --- FIX #1: Use feedback_request and check 'approve' permission ---
         if feedback_request.apply_immediately and "approve" in current_user.permissions:
@@ -551,6 +593,14 @@ async def submit_learning_feedback(
             # Admin or user with 'approve' permission can immediately approve
             engine.feedback_manager.approve_pattern(pattern_id, approved_by=current_user.username)
             logger.info(f"User {current_user.username} auto-approved pattern {pattern_id[:8]}")
+
+            # Log the auto-approval
+            log_audit_event(current_user, "APPROVE_LEARNING_PATTERN", {
+                "resource_type": "learning_pattern",
+                "resource_id": pattern_id,
+                "pattern_id": pattern_id[:8],
+                "auto_approved": True
+            }, db, request)
 
             return {
                 "status": "success",
@@ -568,12 +618,15 @@ async def submit_learning_feedback(
 
     except Exception as e:
         logger.error(f"Learning feedback error: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/learning/approve")
 async def approve_learning_pattern(
     approval_request: LearningPatternApproval,
-    current_user: User = Depends(get_current_user)
+    request: Request,  # ADDED for IP/User-Agent
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)  # ADDED for DB session
 ):
     """
     Approve or reject learning pattern
@@ -611,12 +664,14 @@ async def approve_learning_pattern(
         if not success:
             raise HTTPException(status_code=404, detail="Pattern not found")
 
-        # Log audit event
+        # Log audit event to database
         log_audit_event(current_user, action, {
+            "resource_type": "learning_pattern",
+            "resource_id": approval_request.pattern_id,
             "pattern_id": approval_request.pattern_id[:8],
             "approved": approval_request.approved,
             "reason": approval_request.reason
-        })
+        }, db, request)
 
         return {
             "status": "success",
@@ -629,6 +684,7 @@ async def approve_learning_pattern(
         raise
     except Exception as e:
         logger.error(f"Pattern approval error: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/learning/pending")
@@ -743,29 +799,45 @@ async def health_check():
         "learning_enabled": engine.is_learning_enabled() if engine else False
     }
 
+# --- FIX: READ AUDIT LOG FROM DATABASE ---
 @app.get("/api/audit-log")
 async def get_audit_log(
     limit: int = 100,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     """
-    Get audit log entries
+    Get audit log entries from the database
 
     Requires: 'approve' permission (admin only)
 
-    HIPAA compliance: tracks all user actions.
+    HIPAA compliance: tracks all user actions with full persistence.
     """
     check_permission(current_user, "approve")
 
-    # Return most recent entries
-    recent_entries = AUDIT_LOG[-limit:] if len(AUDIT_LOG) > limit else AUDIT_LOG
+    try:
+        total_entries = db.query(AuditLog).count()
+        recent_entries = db.query(AuditLog).order_by(desc(AuditLog.timestamp)).limit(limit).all()
 
-    return {
-        "status": "success",
-        "entry_count": len(recent_entries),
-        "total_entries": len(AUDIT_LOG),
-        "entries": recent_entries
-    }
+        return {
+            "status": "success",
+            "entry_count": len(recent_entries),
+            "total_entries": total_entries,
+            "entries": [
+                {
+                    "timestamp": entry.timestamp.isoformat(),
+                    "user_id": entry.user_id,
+                    "action": entry.action,
+                    "resource_type": entry.resource_type,
+                    "details": entry.details,
+                    "ip_address": entry.ip_address,
+                    "user_agent": entry.user_agent
+                } for entry in recent_entries
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Failed to retrieve audit log: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve audit log")
 
 # ========================= ROOT ENDPOINT =========================
 
@@ -785,7 +857,9 @@ async def root():
             "Learning system with approval workflow",
             "Parallel processing",
             "Multi-level caching",
-            "Database-backed user authentication"
+            "Database-backed user authentication",
+            "Database-backed audit logging (HIPAA compliant)",
+            "Database-backed processing sessions"
         ]
     }
 
@@ -821,24 +895,7 @@ async def general_exception_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
     # This block is for direct execution, not for production
-    # Create a default admin user in the DB if it doesn't exist (for SQLite dev)
-    with get_db_session() as db:
-        admin = get_user("admin", db)
-        if not admin:
-            logger.info("Creating default 'admin' user with password 'admin123'")
-            admin_user = UserModel(
-                username="admin",
-                full_name="System Administrator",
-                email="admin@hospital.org",
-                hashed_password=pwd_context.hash("admin123"),
-                department="it",
-                role="admin",
-                permissions=["read", "write", "approve", "manage"],
-                is_active=True
-            )
-            db.add(admin_user)
-            db.commit()
-
+    # Admin user creation moved to startup_event for consistency
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
