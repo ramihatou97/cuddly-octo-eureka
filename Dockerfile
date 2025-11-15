@@ -14,9 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
+# Create virtual environment and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Runtime
 FROM python:3.9-slim
@@ -31,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python dependencies from builder
-COPY --from=builder /root/.local /root/.local
+COPY --from=builder /opt/venv /opt/venv
 
 # Copy application code
 COPY src/ ./src/
@@ -43,13 +45,14 @@ COPY requirements.txt .
 # Create logs directory
 RUN mkdir -p /app/logs
 
-# Set Python path
-ENV PYTHONPATH=/app
-ENV PATH=/root/.local/bin:$PATH
-
 # Create non-root user for security
 RUN useradd -m -u 1000 dcsapp && \
-    chown -R dcsapp:dcsapp /app
+    chown -R dcsapp:dcsapp /app && \
+    chown -R dcsapp:dcsapp /opt/venv
+
+# Set Python path and virtual environment
+ENV PYTHONPATH=/app
+ENV PATH="/opt/venv/bin:$PATH"
 
 USER dcsapp
 

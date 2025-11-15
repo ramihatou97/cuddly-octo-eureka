@@ -79,6 +79,33 @@ engine: Optional[HybridNeurosurgicalDCSEngine] = None
 
 # Pre-computed bcrypt hashes to avoid runtime hashing issues
 USER_DATABASE = {
+    "admin": {
+        "username": "admin",
+        "full_name": "System Administrator",
+        "email": "admin@hospital.org",
+        "hashed_password": "$2b$12$Egb/PKG/5iNBPZ7Q3VZaEOOX/f0nX.qW1aBD5nwYuB1QMiyzT.5.u",  # admin123
+        "department": "it",
+        "role": "admin",
+        "permissions": ["read", "write", "approve", "manage"]
+    },
+    "clinician": {
+        "username": "clinician",
+        "full_name": "Clinical User",
+        "email": "clinician@hospital.org",
+        "hashed_password": "$2b$12$iZ4symqGjFoHECCjUM27iu/7rAUO2lRl1MpLiV/TPbE3MYnMrTaDu",  # clinical123
+        "department": "neurosurgery",
+        "role": "clinician",
+        "permissions": ["read", "write"]  # Can generate summaries
+    },
+    "reviewer": {
+        "username": "reviewer",
+        "full_name": "Reviewer User",
+        "email": "reviewer@hospital.org",
+        "hashed_password": "$2b$12$x.n2ic25yFrcU5eVWrfygeaYUI9ftqlzFTuBuYoyBxqo4ylyKdHva",  # review123
+        "department": "neurosurgery",
+        "role": "reviewer",
+        "permissions": ["read"]  # Read-only access
+    },
     "dr.smith": {
         "username": "dr.smith",
         "full_name": "Dr. Sarah Smith",
@@ -96,15 +123,6 @@ USER_DATABASE = {
         "department": "neurosurgery",
         "role": "resident",
         "permissions": ["read", "write"]  # Cannot approve patterns
-    },
-    "admin": {
-        "username": "admin",
-        "full_name": "System Administrator",
-        "email": "admin@hospital.org",
-        "hashed_password": "$2b$12$Egb/PKG/5iNBPZ7Q3VZaEOOX/f0nX.qW1aBD5nwYuB1QMiyzT.5.u",  # admin123
-        "department": "it",
-        "role": "admin",
-        "permissions": ["read", "write", "approve", "manage"]
     }
 }
 
@@ -119,7 +137,7 @@ PROCESSING_SESSIONS = {}
 class Token(BaseModel):
     access_token: str
     token_type: str
-    user_info: Dict[str, Any]
+    user: Dict[str, Any]
 
 class TokenData(BaseModel):
     username: Optional[str] = None
@@ -150,6 +168,23 @@ class LearningPatternApproval(BaseModel):
     pattern_id: str
     approved: bool  # True = approve, False = reject
     reason: Optional[str] = None  # For rejection
+
+class BulkImportRequest(BaseModel):
+    bulk_text: str
+    separator_type: str = 'auto'  # auto, triple_dash, custom
+    custom_separator: Optional[str] = None
+
+class SuggestedDocument(BaseModel):
+    content: str
+    doc_type: Optional[str] = None
+    confidence: float = 0.0
+    date: Optional[str] = None
+    author: Optional[str] = None
+
+class BulkImportResponse(BaseModel):
+    status: str
+    suggested_documents: List[Dict[str, Any]]
+    warnings: List[str] = []
 
 # ========================= AUTHENTICATION FUNCTIONS =========================
 
@@ -286,11 +321,15 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user_info": {
+        "user": {
+            "id": user_dict.get("id", user_dict["username"]),
             "username": user_dict["username"],
+            "email": user_dict["email"],
             "full_name": user_dict["full_name"],
-            "role": user_dict["role"],
-            "permissions": user_dict["permissions"]
+            "is_active": user_dict.get("is_active", True),
+            "is_superuser": user_dict.get("role") == "admin",
+            "permissions": user_dict["permissions"],
+            "created_at": user_dict.get("created_at", datetime.utcnow().isoformat())
         }
     }
 
@@ -355,6 +394,112 @@ async def process_documents(
 
     except Exception as e:
         logger.error(f"Processing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ========================= BULK IMPORT ENDPOINTS =========================
+
+@app.post("/api/bulk-import/parse", response_model=BulkImportResponse)
+async def parse_bulk_documents(
+    request: BulkImportRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Parse bulk text into suggested documents (SAFETY: parse only, no processing)
+
+    Splits bulk text by separator and extracts metadata.
+    Returns suggestions that require user verification before processing.
+
+    Requires: 'write' permission
+    """
+    check_permission(current_user, "write")
+
+    try:
+        import re
+        from datetime import datetime
+
+        warnings = []
+        suggested_documents = []
+
+        # Determine separator
+        separator = None
+        if request.separator_type == 'auto':
+            # Auto-detect triple dash separator
+            if '---' in request.bulk_text:
+                separator = '---'
+            elif '\n\n\n' in request.bulk_text:
+                separator = '\n\n\n'
+            else:
+                warnings.append("No clear separator found. Using double newline as fallback.")
+                separator = '\n\n'
+        elif request.separator_type == 'triple_dash':
+            separator = '---'
+        elif request.separator_type == 'custom' and request.custom_separator:
+            separator = request.custom_separator
+        else:
+            raise HTTPException(status_code=400, detail="Invalid separator configuration")
+
+        # Split text into chunks
+        chunks = [chunk.strip() for chunk in request.bulk_text.split(separator) if chunk.strip()]
+
+        if len(chunks) == 0:
+            return BulkImportResponse(
+                status="error",
+                suggested_documents=[],
+                warnings=["No documents found in bulk text"]
+            )
+
+        # Document type keywords for detection
+        doc_type_patterns = {
+            'Admission Note': r'(?i)(admission|admit|admitting)',
+            'Progress Note': r'(?i)(progress|daily|soap)',
+            'Operative Note': r'(?i)(operative|surgery|procedure|operation)',
+            'Consult Note': r'(?i)(consult|consultation)',
+            'Discharge Summary': r'(?i)(discharge|summary)',
+            'Imaging Report': r'(?i)(ct|mri|x-ray|imaging|radiology)',
+            'Lab Report': r'(?i)(lab|laboratory|pathology)',
+        }
+
+        # Date patterns (common formats)
+        date_pattern = r'(\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}|\w+ \d{1,2},? \d{4})'
+
+        # Process each chunk
+        for idx, chunk in enumerate(chunks):
+            doc_type = None
+            confidence = 0.0
+            detected_date = None
+
+            # Detect document type
+            for dtype, pattern in doc_type_patterns.items():
+                if re.search(pattern, chunk[:500]):  # Check first 500 chars
+                    doc_type = dtype
+                    confidence = 0.7  # Moderate confidence
+                    break
+
+            # Extract date
+            date_match = re.search(date_pattern, chunk[:300])
+            if date_match:
+                detected_date = date_match.group(1)
+
+            # Create suggested document
+            suggested_documents.append({
+                'content': chunk,
+                'doc_type': doc_type,
+                'confidence': confidence,
+                'date': detected_date,
+                'author': None,  # Could be enhanced with author detection
+                'index': idx
+            })
+
+        logger.info(f"Bulk parse: {len(suggested_documents)} documents suggested by {current_user.username}")
+
+        return BulkImportResponse(
+            status="success",
+            suggested_documents=suggested_documents,
+            warnings=warnings
+        )
+
+    except Exception as e:
+        logger.error(f"Bulk import parse error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ========================= LEARNING SYSTEM ENDPOINTS =========================
