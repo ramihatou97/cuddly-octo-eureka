@@ -35,11 +35,37 @@ export interface TimelineEvent {
 
 export interface Uncertainty {
   id: string;
-  type: 'ambiguous_dose' | 'unclear_timeline' | 'conflicting_information' | 'missing_data';
+  type: string; // Backend returns various types: MISSING_INFORMATION, CONFLICTING_INFORMATION, etc.
+  uncertainty_type?: string; // Alias field from backend
   description: string;
-  context: string;
+  severity: 'HIGH' | 'MEDIUM' | 'LOW'; // Required for UI display
+  suggested_resolution?: string; // Backend suggestion for resolution
+  context: Record<string, any>; // Flexible context object
+  sources?: string[]; // Conflicting sources (from backend: conflicting_sources)
+  conflicting_sources?: string[]; // Alias from backend
   options?: string[];
   resolved: boolean;
+}
+
+/**
+ * Learning feedback request (matches backend LearningFeedbackRequest)
+ */
+export interface LearningFeedbackRequest {
+  uncertainty_id: string;
+  original_extraction: string;
+  correction: string;
+  context: Record<string, any>;
+  apply_immediately?: boolean;
+}
+
+/**
+ * Learning feedback response (from POST /api/learning/feedback)
+ */
+export interface LearningFeedbackResponse {
+  status: string;
+  pattern_id: string;
+  pattern_status: 'PENDING_APPROVAL' | 'APPROVED';
+  message: string;
 }
 
 export interface ProcessingMetrics {

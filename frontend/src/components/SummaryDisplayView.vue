@@ -86,41 +86,15 @@
           Uncertainties Requiring Review
           <span class="ml-2 text-sm font-normal text-gray-500">({{ uncertainties.length }})</span>
         </h3>
-        <div class="space-y-3">
-          <div
+        <div class="space-y-4">
+          <UncertaintyCard
             v-for="(uncertainty, index) in uncertainties"
-            :key="index"
-            class="border rounded-lg p-4"
-            :class="{
-              'border-red-300 bg-red-50': uncertainty.severity === 'HIGH',
-              'border-yellow-300 bg-yellow-50': uncertainty.severity === 'MEDIUM',
-              'border-gray-300 bg-gray-50': uncertainty.severity === 'LOW'
-            }"
-          >
-            <div class="flex items-start justify-between">
-              <div class="flex-1">
-                <div class="flex items-center">
-                  <span
-                    :class="{
-                      'bg-red-100 text-red-800': uncertainty.severity === 'HIGH',
-                      'bg-yellow-100 text-yellow-800': uncertainty.severity === 'MEDIUM',
-                      'bg-gray-100 text-gray-800': uncertainty.severity === 'LOW'
-                    }"
-                    class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
-                  >
-                    {{ uncertainty.severity || 'MEDIUM' }}
-                  </span>
-                  <span class="ml-2 text-sm font-medium text-gray-700">
-                    {{ uncertainty.uncertainty_type || uncertainty.type }}
-                  </span>
-                </div>
-                <p class="mt-2 text-sm text-gray-600">{{ uncertainty.description }}</p>
-                <p v-if="uncertainty.suggested_resolution" class="mt-2 text-sm text-gray-500 italic">
-                  Suggested: {{ uncertainty.suggested_resolution }}
-                </p>
-              </div>
-            </div>
-          </div>
+            :key="uncertainty.id || index"
+            :uncertainty="uncertainty"
+            :session-id="sessionId"
+            @feedback-submitted="handleFeedbackSubmitted"
+            @resolved="handleUncertaintyResolved"
+          />
         </div>
       </div>
 
@@ -179,6 +153,7 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue';
 import { useSession } from '@/composables/useSession';
+import UncertaintyCard from './UncertaintyCard.vue';
 
 const props = defineProps<{
   sessionId: string;
@@ -197,6 +172,19 @@ function formatTime(ms: number | undefined): string {
   if (!ms) return '0s';
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// Event handlers for uncertainty resolution
+function handleFeedbackSubmitted(uncertaintyId: string) {
+  console.log('Feedback submitted for uncertainty:', uncertaintyId);
+  // Optionally refetch session to get updated data
+  // fetchSession(props.sessionId);
+}
+
+function handleUncertaintyResolved(uncertaintyId: string) {
+  console.log('Uncertainty resolved:', uncertaintyId);
+  // The uncertainty card will handle its own resolved state
+  // We could show a toast notification here if desired
 }
 
 // Fetch session data on mount
