@@ -1,0 +1,52 @@
+# Neurosurgical DCS Hybrid - Docker Ignore File
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation (not needed in container)
+*.md
+!README.md
+
+# Git
+.git/
+.gitignore
+
+# Environment
+.env
+.env.*
+
+# Logs (will be mounted as volume)
+logs/
+
+# Downloads (if any)
+downloads/
+/Users/
+
+# macOS
+.DS_Store
+
+# Development
+docker-compose.override.yml

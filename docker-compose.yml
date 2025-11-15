@@ -1,0 +1,108 @@
+version: '3.8'
+
+# Neurosurgical DCS Hybrid - Complete Docker Deployment
+# Includes: API, PostgreSQL, Redis, Nginx
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: dcs-postgres
+    environment:
+      POSTGRES_DB: neurosurgical_dcs
+      POSTGRES_USER: dcs_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me_in_production}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dcs_user -d neurosurgical_dcs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dcs-network
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: dcs-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-change_me_in_production}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dcs-network
+    restart: unless-stopped
+
+  # DCS API Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dcs-api
+    environment:
+      - DATABASE_URL=postgresql://dcs_user:${DB_PASSWORD:-change_me_in_production}@postgres:5432/neurosurgical_dcs
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-change_me_in_production}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-generate_with_openssl_rand_hex_32}
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=480
+      - ENABLE_LEARNING_SYSTEM=true
+      - REQUIRE_LEARNING_APPROVAL=true
+      - USE_CACHE=true
+      - USE_PARALLEL_PROCESSING=true
+    volumes:
+      - ./logs:/app/logs
+      - ./frontend:/app/frontend:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/system/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - dcs-network
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy (Production)
+  nginx:
+    image: nginx:alpine
+    container_name: dcs-nginx
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html/frontend:ro
+      - ./docker/ssl:/etc/nginx/ssl:ro  # Mount SSL certificates here
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+    networks:
+      - dcs-network
+    restart: unless-stopped
+
+networks:
+  dcs-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
